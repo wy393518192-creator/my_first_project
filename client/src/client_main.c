@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <sys/ipc.h>
 #include <sys/fcntl.h>
+#include <time.h>
+
 
 //结构体，用来分辨是信息还是心跳，以及信息长度
 typedef struct
