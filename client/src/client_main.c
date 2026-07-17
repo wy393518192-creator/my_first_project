@@ -23,12 +23,48 @@ typedef struct
     int len;  // 信息长度
 }TYD;
 
+//心跳线程
 void* func_hrartbest(void * arg)
 {
+    int sockfd = *(int*)arg;
+
+    TYD best;
+    best.form = 0;
+    best.len = 0;
+
     while(1)
     {
-        
+        send(sockfd,&best,sizeof(best),0);
+        sleep(5);
     }
+    return NULL;
+}
+
+typedef struct
+{
+    char buff[16]; //配置文件中的IP地址
+    int port;      //配置文件中的port端口
+
+}IP_CF;
+
+//获取配置文件中的值，来设置服务器的IP和端口
+IP_CF func_ipconfig()
+{
+    FILE* fptr = fopen("./../server_ipconfigfile.txt","r");
+    if(fptr == NULL)
+    {
+        printf("fopen error!\n");
+        fflush(stdout);
+        exit(1);
+    }
+
+    IP_CF temp = {0};
+    fscanf(fptr, "ip = %s", temp.buff);
+    fscanf(fptr, "port = %d", &(temp.port));
+
+    fclose(fptr);
+
+    return temp;
 }
 
 int main()
@@ -42,15 +78,18 @@ int main()
         return 1;
     }
 
+   IP_CF ip_cf = func_ipconfig();
+
     struct sockaddr_in addr = {0};
+    socklen_t len = sizeof(addr);
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(8888);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(ip_cf.port);
+    addr.sin_addr.s_addr = inet_addr(ip_cf.buff);
 
     int res = connect(sockfd,(struct sockaddr*)&addr,sizeof(addr));
     if(res != 0)
     {
-        perror("socket error!");
+        perror("connect error!");
         close(sockfd);
         return 1;
     }
@@ -86,9 +125,8 @@ int main()
     memset(buff,0,sizeof(buff));
 
     // 创建心跳线程，保持与服务器的链接状态
-
-
-
+    pthread_t tid;
+    pthread_create(&tid,NULL,func_hrartbest,(void*)&sockfd);
 
 
 

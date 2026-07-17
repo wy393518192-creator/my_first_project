@@ -21,7 +21,7 @@
 //条件锁，互斥锁，读写锁
 pthread_cond_t cond;
 pthread_mutex_t mutex;
-pthread_rwlock_t rwlock;
+
 
 //最大心跳时间间隔
 #define MAX_TIME  15.0
@@ -64,9 +64,11 @@ void node_process(SOC* head, SOC* new_node)
         pthread_mutex_unlock(&mutex);
     }else
     {
+        pthread_mutex_lock(&mutex);
         SOC* temp = head->next;
         head->next = new_node;
         new_node->next = temp;
+        pthread_mutex_unlock(&mutex);
     }
     return;
 }
@@ -97,9 +99,9 @@ void* func_client(void* arg)
         {
             printf("ip为：%s客户端的心跳....\n",ptr->ip);
 
-            pthread_rwlock_wrlock(&rwlock);
+            pthread_mutex_lock(&mutex);
             ptr->ti = time(NULL);
-            pthread_rwlock_unlock(&rwlock);
+            pthread_mutex_unlock(&mutex);
         
         }else
         {
@@ -127,37 +129,73 @@ void monitor_func(void)
     SOC* ptr_temp = &head;
     while(1)
     {
-        //心跳超时了
-        time_t now_time = time(NULL);
-        if(difftime(ptr->ti,now_time) > MAX_TIME)
+        
+        while(ptr != NULL)
         {
-            pthread_rwlock_wrlock(&rwlock);
+             //心跳超时了
+            time_t now_time = time(NULL);
+            if(difftime(ptr->ti,now_time) > MAX_TIME)
+            {
+                pthread_mutex_unlock(&mutex);
 
-            ptr_temp->next = ptr->next;
-            close(ptr->sockfd);
-            printf("free sockfd %d,id %s,tid %d\n", ptr->sockfd, ptr->ip, ptr->tid);
-            free(ptr);
-            ptr = ptr_temp->next;
+                if(difftime(ptr->ti,now_time) > MAX_TIME)
+                {
+                    ptr_temp->next = ptr->next;
+                    close(ptr->sockfd);
+                    printf("free sockfd %d,id %s,tid %d\n", ptr->sockfd, ptr->ip, ptr->tid);
+                    free(ptr);
+                    ptr = ptr_temp->next;
+                }
 
-            pthread_rwlock_unlock(&rwlock);
+                pthread_mutex_unlock(&mutex);
+            }
+
+            ptr_temp = ptr_temp->next;
+            ptr = ptr->next;
+
         }
 
-        ptr_temp = ptr_temp->next;
-        ptr = ptr->next;
-        if(ptr == NULL)
-        {
-            ptr_temp = &head;
-            ptr = head.next;
-        }
+        ptr_temp = &head;
+        ptr = head.next;
+
+        sleep(5);
+
     }
 
+    return;
+}
+
+typedef struct
+{
+    char buff[16]; //配置文件中的IP地址
+    int port;      //配置文件中的port端口
+
+}IP_CF;
+
+//获取配置文件中的值，来设置服务器的IP和端口
+IP_CF func_ipconfig()
+{
+    FILE* fptr = fopen("./../server_ipconfigfile.txt","r");
+    if(fptr == NULL)
+    {
+        printf("fopen error!\n");
+        fflush(stdout);
+        exit(1);
+    }
+
+    IP_CF temp = {0};
+    fscanf(fptr, "ip = %s", temp.buff);
+    fscanf(fptr, "port = %d", &(temp.port));
+
+    fclose(fptr);
+
+    return temp;
 }
 
 int main()
 {
     pthread_cond_init(&cond,NULL);
     pthread_mutex_init(&mutex,NULL);
-    pthread_rwlock_init(&rwlock,NULL);
 
     int ttid = 0;
     int result = 0;
@@ -178,11 +216,13 @@ int main()
         return 1;
     }
 
+    IP_CF ip_cf = func_ipconfig();
+
     struct sockaddr_in addr = {0};
     socklen_t len = sizeof(addr);
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(8888);
-    addr.sin_addr.s_addr = inet_addr(INADDR_ANY);
+    addr.sin_port = htons(ip_cf.port);
+    addr.sin_addr.s_addr = inet_addr(ip_cf.buff);
 
     if(bind(sockfd,&addr,len) < 0)
     {
@@ -201,6 +241,10 @@ int main()
     printf("服务器已启动，本服务器端口为%d,ip地址为：%s,监听中...\n",
         ntohs(addr.sin_port), inet_ntoa(addr.sin_addr));
 
+    //创建结构体链表中的头节点，存储客户端信息
+    SOC head = {0};
+    head.next = NULL;
+    
     while(1)
     {
         //本结构体用来存储客户端的信息,以及其大小信息
@@ -251,6 +295,8 @@ int main()
             continue;
         }
         ptr->tid = tid;
+        //将新的结构体放入链表的节点中
+        node_process(&head, ptr);
 
         //创建完线程后，直接将线程分离，从而不需要主线程回收线程资源，而是线程结束后自动回收资源
         pthread_detach(tid);
@@ -258,7 +304,7 @@ int main()
 
     pthread_mutex_destroy(&mutex);
     pthread_cond_destroy(&cond);
-    pthread_rwlock_destroy(&rwlock);
+
 
     return 0;
 }
