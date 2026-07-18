@@ -132,11 +132,10 @@ int main()
 
     while(logo)
     {
-        int flag = 0;
+        
         int chose = 0;
         do
         {
-            flag = 0;
             printf("---------------------客户界面-----------------------\n");
             printf("1.登录\n");
             printf("2.注册\n");
@@ -146,12 +145,13 @@ int main()
             int res = scanf("%d", &chose);
             char ch;
             while((ch = getchar()) != '\n' && ch != EOF);
-            if(res != 1)
+            if(res == 1)
             {
-                flag = 1;
-                printf("输入有误，请重新输入！\n");
+                break;   
             }
-        }while(flag);
+            printf("输入有误，请重新输入！\n");
+
+        }while(1);
 
         switch(chose)
         {
@@ -167,7 +167,6 @@ int main()
         }
 
     }
-
 
 
     return 0;
