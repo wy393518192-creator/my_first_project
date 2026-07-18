@@ -128,6 +128,46 @@ int main()
     pthread_t tid;
     pthread_create(&tid,NULL,func_hrartbest,(void*)&sockfd);
 
+    int  logo = 1;
+
+    while(logo)
+    {
+        int flag = 0;
+        int chose = 0;
+        do
+        {
+            flag = 0;
+            printf("---------------------客户界面-----------------------\n");
+            printf("1.登录\n");
+            printf("2.注册\n");
+            printf("3.退出\n");
+            printf("-----------------------------------------------------\n");
+            printf("请输入你的选择：");
+            int res = scanf("%d", &chose);
+            char ch;
+            while((ch = getchar()) != '\n' && ch != EOF);
+            if(res != 1)
+            {
+                flag = 1;
+                printf("输入有误，请重新输入！\n");
+            }
+        }while(flag);
+
+        switch(chose)
+        {
+            case 1:
+                break;
+            case 2:
+                break;
+            case 3:
+                logo = 0;
+                break;
+            default:
+                break;
+        }
+
+    }
+
 
 
     return 0;

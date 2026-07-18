@@ -52,7 +52,7 @@ typedef struct clinet_node
 
 static SOC head = {0};//初始化，next指针为null
 
-//将线程的信息放入一个结构体中的函数
+//将线程的信息放入一个结构体链表中的函数
 void node_process(SOC* head, SOC* new_node)
 {
     // 头插
@@ -115,8 +115,10 @@ void* func_client(void* arg)
 }
 
 //监控函数，判断心跳是否超时
-void monitor_func(void)
+void monitor_func(void* arg)
 {
+    FILE* fptr = (FILE*)arg;
+
     //如果是头节点后面为空，先睡觉，等插了第一个节点被唤醒
     if(head.next == NULL)
     {
@@ -138,9 +140,11 @@ void monitor_func(void)
             {
                 pthread_mutex_unlock(&mutex);
 
+                now_time = time(NULL);
                 if(difftime(ptr->ti,now_time) > MAX_TIME)
                 {
                     ptr_temp->next = ptr->next;
+                    fprintf(fptr,"时间：%ld,客户端IP：%s链接超时，服务器与其断开链接!\n", now_time, ptr->ip);
                     close(ptr->sockfd);
                     printf("free sockfd %d,id %s,tid %d\n", ptr->sockfd, ptr->ip, ptr->tid);
                     free(ptr);
@@ -197,14 +201,30 @@ int main()
     pthread_cond_init(&cond,NULL);
     pthread_mutex_init(&mutex,NULL);
 
+    FILE* fptr = fopen("log.txt","a");
+    if(fptr == NULL)
+    {
+        printf("log open error!\n");
+        fflush(stdout);
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&cond);
+        exit(1);
+    }
+
+
     int ttid = 0;
     int result = 0;
     //监控心跳是否超时线程
-    if( (result = pthread_create(&ttid,NULL,(void*(*)(void*))monitor_func,NULL)) != 0 )
+    if( (result = pthread_create(&ttid,NULL,(void*(*)(void*))monitor_func,(void*)fptr)) != 0 )
     {
         // 线程开启失败，发送链接失败信号
         fprintf(stderr,"pthread_create error:%s\n",strerror(result));
         printf("monitor error!\n");
+        time_t tim = time(NULL);
+        fprintf(fptr,"时间：%ld,心跳线程开启失败！\n",tim);
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&cond);
+        fclose(fptr);
         exit(1);
     }
 
@@ -213,6 +233,11 @@ int main()
     if(sockfd < 0)
     {
         perror("socket error!");
+        time_t tim = time(NULL);
+        fprintf(fptr,"时间：%ld,套接字创建失败！\n",tim);
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&cond);
+        fclose(fptr);
         return 1;
     }
 
@@ -227,19 +252,30 @@ int main()
     if(bind(sockfd,&addr,len) < 0)
     {
         perror("bind error!");
+        time_t tim = time(NULL);
+        fprintf(fptr,"时间：%ld,套接字绑定失败！\n",tim);
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&cond);
         close(sockfd);
+        fclose(fptr);
         return 1;
     }
 
     if(listen(sockfd,50) < 0)
     {
         perror("listen error!");
+        time_t tim = time(NULL);
+        fprintf(fptr,"时间：%ld,监听失败！\n",tim);
         close(sockfd);
+        fclose(fptr);
         return 1;
     }
 
     printf("服务器已启动，本服务器端口为%d,ip地址为：%s,监听中...\n",
         ntohs(addr.sin_port), inet_ntoa(addr.sin_addr));
+    time_t ttim = time(NULL);
+    fprintf(fptr,"时间：%ld,服务器已启动，本服务器端口为%d,ip地址为：%s,监听中...\n",ttim);
+    fflush(stdout);
 
     //创建结构体链表中的头节点，存储客户端信息
     SOC head = {0};
@@ -256,6 +292,9 @@ int main()
         {
             //出错就跳过本次接听
             perror("accept error!");
+            ttim = time(NULL);
+            fprintf(fptr,"时间：%ld,accept error\n",ttim);
+            fflush(stdout);
             continue;
         }
 
@@ -265,6 +304,12 @@ int main()
         {
             printf("malloc error!\n");
             close(sockfd);
+            pthread_mutex_destroy(&mutex);
+            pthread_cond_destroy(&cond);
+            ttim = time(NULL);
+            fprintf(fptr,"时间：%ld,malloc error!\n",ttim);
+            fflush(stdout);
+            fclose(fptr);
             return 1;
         }
 
@@ -289,6 +334,8 @@ int main()
             bag.form = 1, bag.len = strlen("server busy...");
             send(sockfd_client,&bag,sizeof(bag),0);
             send(sockfd_client,"server busy...",sizeof("server busy..."),0);
+            ttim = time(NULL);
+            fprintf(fptr,"时间：%ld；线程创建失败！套接字为%d,链接客户端id为：%s，服务器关闭与其链接！\n",ttim, ptr->sockfd, ptr->ip);
             memset(&bag,0,sizeof(bag));
             free(ptr);
             close(sockfd_client);
@@ -298,6 +345,9 @@ int main()
         //将新的结构体放入链表的节点中
         node_process(&head, ptr);
 
+        ttim = time(NULL);
+        fprintf(fptr,"时间：%ld；%d线程创建完毕！套接字为%d,链接客户端id为：%s\n",ttim, tid, ptr->sockfd, ptr->ip);
+
         //创建完线程后，直接将线程分离，从而不需要主线程回收线程资源，而是线程结束后自动回收资源
         pthread_detach(tid);
     }
@@ -305,6 +355,11 @@ int main()
     pthread_mutex_destroy(&mutex);
     pthread_cond_destroy(&cond);
 
+
+    ttim = time(NULL);
+    fprintf(fptr,"时间：%ld,服务器关闭！\n",ttim);
+    fflush(stdout);
+    fclose(fptr);
 
     return 0;
 }
