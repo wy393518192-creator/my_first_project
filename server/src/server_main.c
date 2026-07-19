@@ -5,266 +5,698 @@
 #include "stype.h"
 #include "user.h"
 
-#define VISITOR 0 // 执行信息
-#define USER 1 //普通信息
+#include <signal.h>
 
-//条件锁，互斥锁，读写锁
+#define VISITOR 0 // 最外层功能命令
+#define USER    1 // 普通文本消息
+
+// 条件锁，互斥锁
 pthread_cond_t cond;
 pthread_mutex_t mutex;
 
+// 最大心跳时间间隔
+#define MAX_TIME 15.0
 
-//最大心跳时间间隔
-#define MAX_TIME  15.0
+// 定义一个指向客户端信息的头指针（不存储数据）
+SOC head = {0};
 
-
-// 定义一个指向客户端信息的头指针（不存储数据 ）
-static SOC head = {0};//初始化，next指针为null
-
-//定义一个客户账号信息的头节点（不存储数据，第二个节点，即首元节点才存储数据）
+// 定义一个客户账号信息的头节点（不存储数据）
 USE head_user = {0};
 
-// 在文件中加载账号数据（当服务器开启时，加载已经注册的用户的信息）
-void func_user()
+// 全局群注册表（只保存群账号，不重复保存）
+GROUP g_group_head = {0};
+
+// 全局服务器socket
+int g_server_sock = -1;
+
+// 日志文件
+FILE* g_log_fp = NULL;
+
+// 下面这些函数都不要写 static，后续你要拆到其他文件里
+
+// 释放好友链表
+void free_friend_list(FRIEND* list)
 {
-    FILE* ufptr = open("./../data/userdata.txt", "r");
-    if(ufptr == NULL)
+    FRIEND* p = list;
+    while (p != NULL)
     {
-        printf("数据加载失败！\n");
-        exit(1);
+        FRIEND* q = p->fnext;
+        free(p);
+        p = q;
     }
-
-    USE* temp1 = &head_user;
-    USE temp2 = {0};
-    while(fread(&temp2, sizeof(USE), 1, ufptr) > 0)
-    {
-        USE* temp3 = (USE*)calloc(1,sizeof(USE));//就不判错了
-        *temp3 = temp2;
-        temp3->unext = NULL;
-        temp3->friend.fnext = NULL;
-        temp3->group.gnext = NULL;
-
-        if(temp3->friend.fnum > 0)
-        {
-
-            temp3->friend.fnext = (FRIEND*)calloc(1, sizeof(FRIEND));
-            FRIEND *fritemp = temp3->friend.fnext;
-            FRIEND* fri;
-            
-            
-            for(int i = 0; i < temp3->friend.fnum; i++)
-            {
-                
-                fread(fritemp,sizeof(FRIEND),1,ufptr);
-                fritemp->fnext = NULL;
-                fri = fritemp;
-                fri->fnext = (FRIEND*)calloc(1, sizeof(FRIEND));
-                fritemp = fri->fnext;
-            }
-            
-            free(fritemp);
-            fri->fnext = NULL;
-
-        }
-
-        if(temp3->group.gnum > 0)
-        {
-
-            temp3->group.gnum = (GROUP*)calloc(1, sizeof(GROUP));
-            GROUP *grotemp = temp3->group.gnext;
-            GROUP* gro;
-            
-            
-            for(int J = 0; J < temp3->group.gnum; J++)
-            {
-                
-                fread(grotemp,sizeof(GROUP),1,ufptr);
-                grotemp->gnext = NULL;
-                gro = grotemp;
-                gro->gnext = (GROUP*)calloc(1, sizeof(GROUP));
-                grotemp = gro->gnext;
-            }
-            
-            free(grotemp);
-            gro->gnext = NULL;
-
-        }
-
-
-        temp1->unext = temp3;
-        memset(&temp2,0,sizeof(USE));
-        temp1 = temp1->unext;
-    }
-
-    //加载完数据，关闭文件
-    fclose(ufptr);
-
 }
 
+// 释放群链表
+void free_group_list(GROUP* list)
+{
+    GROUP* p = list;
+    while (p != NULL)
+    {
+        GROUP* q = p->gnext;
+        free(p);
+        p = q;
+    }
+}
 
-//将线程的信息放入一个结构体链表中的函数
+// 释放全部用户链表
+void free_user_list(void)
+{
+    USE* p = head_user.unext;
+    while (p != NULL)
+    {
+        USE* q = p->unext;
+        free_friend_list(p->friend.fnext);
+        free_group_list(p->group.gnext);
+        free(p);
+        p = q;
+    }
+    head_user.unext = NULL;
+}
+
+// 释放全部在线客户端链表
+void free_client_list(void)
+{
+    SOC* p = head.next;
+    while (p != NULL)
+    {
+        SOC* q = p->next;
+        close(p->sockfd);
+        free(p);
+        p = q;
+    }
+    head.next = NULL;
+}
+
+// 保存用户数据
+void save_user_data(void)
+{
+    FILE* fp = fopen("./../data/userdata.txt", "wb");
+    if (fp == NULL)
+    {
+        fprintf(stderr, "save_user_data open fail\n");
+        return;
+    }
+
+    USE* u = head_user.unext;
+    while (u != NULL)
+    {
+        fwrite(u, sizeof(USE), 1, fp);
+
+        FRIEND* f = u->friend.fnext;
+        while (f != NULL)
+        {
+            fwrite(f, sizeof(FRIEND), 1, fp);
+            f = f->fnext;
+        }
+
+        GROUP* g = u->group.gnext;
+        while (g != NULL)
+        {
+            fwrite(g, sizeof(GROUP), 1, fp);
+            g = g->gnext;
+        }
+
+        u = u->unext;
+    }
+
+    fclose(fp);
+}
+
+// 统一清理函数：正常退出 / Ctrl+C 强制退出都统一保存
+void cleanup_and_exit(int code)
+{
+    save_user_data();
+
+    free_client_list();
+    free_user_list();
+
+    if (g_log_fp != NULL)
+    {
+        fprintf(g_log_fp, "服务器关闭，状态码=%d\n", code);
+        fflush(g_log_fp);
+        fclose(g_log_fp);
+        g_log_fp = NULL;
+    }
+
+    if (g_server_sock >= 0)
+    {
+        close(g_server_sock);
+        g_server_sock = -1;
+    }
+
+    pthread_cond_destroy(&cond);
+    pthread_mutex_destroy(&mutex);
+    exit(code);
+}
+
+// Ctrl+C 和 SIGTERM 退出时统一调用保存
+void sig_handler(int sig)
+{
+    (void)sig;
+    cleanup_and_exit(0);
+}
+
+// 从文件加载所有用户和其好友、群信息
+void func_user(void)
+{
+    FILE* fp = fopen("./../data/userdata.txt", "rb");
+    if (fp == NULL)
+    {
+        printf("数据文件不存在，按空用户表启动\n");
+        return;
+    }
+
+    USE temp = {0};
+    while (fread(&temp, sizeof(USE), 1, fp) == 1)
+    {
+        USE* node = (USE*)calloc(1, sizeof(USE));
+        if (node == NULL)
+        {
+            perror("calloc use error");
+            continue;
+        }
+
+        *node = temp;
+
+        // 先恢复好友链表
+        for (int i = 0; i < temp.friend.fnum; i++)
+        {
+            FRIEND* f = (FRIEND*)calloc(1, sizeof(FRIEND));
+            if (f == NULL)
+            {
+                perror("calloc friend error");
+                continue;
+            }
+            fread(f, sizeof(FRIEND), 1, fp);
+            f->fnext = node->friend.fnext;
+            node->friend.fnext = f;
+        }
+
+        // 再恢复群链表
+        for (int i = 0; i < temp.group.gnum; i++)
+        {
+            GROUP* g = (GROUP*)calloc(1, sizeof(GROUP));
+            if (g == NULL)
+            {
+                perror("calloc group error");
+                continue;
+            }
+            fread(g, sizeof(GROUP), 1, fp);
+            g->gnext = node->group.gnext;
+            node->group.gnext = g;
+        }
+
+        // 接到用户链表尾部
+        USE* last = &head_user;
+        while (last->unext != NULL)
+        {
+            last = last->unext;
+        }
+        last->unext = node;
+    }
+
+    fclose(fp);
+}
+
+// 把客户端节点加入链表
 void node_process(SOC* head, SOC* new_node)
 {
-    // 头插
-    if(head->next == NULL)
-    {
-        pthread_mutex_lock(&mutex);
-        head->next = new_node;
-        pthread_cond_signal(&cond);
-        pthread_mutex_unlock(&mutex);
-    }else
-    {
-        pthread_mutex_lock(&mutex);
-        SOC* temp = head->next;
-        head->next = new_node;
-        new_node->next = temp;
-        pthread_mutex_unlock(&mutex);
-    }
-    return;
+    pthread_mutex_lock(&mutex);
+
+    new_node->next = head->next;
+    head->next = new_node;
+
+    pthread_mutex_unlock(&mutex);
 }
 
-
-//每个客户端所在线程的 函数
-void* func_client(void* arg)
+// 根据账号查找用户
+USE* find_user(const char* account)
 {
-    //将值保存之后，释放堆内存
-    SOC* ptr = (SOC *)arg;
-
-    TYD bag = {0};
-    // 发送是成功链接
-    bag.form = 1, bag.len = strlen("link successful...");
-    send(ptr->sockfd,&bag,sizeof(bag),0);
-    send(ptr->sockfd,"link successful...",sizeof("link successful..."),0);
-    while(1)
+    USE* p = head_user.unext;
+    while (p != NULL)
     {
-        int res = recv(ptr->sockfd,&bag,sizeof(bag),0);
-        if(res <= 0)
-        {
-            close(ptr->sockfd);
-            printf("sockfd error or end\n");
-            break;
-        }
-
-        if(bag.form == 0)
-        {
-            printf("ip为：%s客户端的心跳....\n",ptr->ip);
-
-            pthread_mutex_lock(&mutex);
-            ptr->ti = time(NULL);
-            pthread_mutex_unlock(&mutex);
-        
-        }else
-        {
-            // 说明是执行指令，客户端在切菜单
-            if(bag.typ == VISITOR)
-            {
-                int chose = 0;
-                recv(ptr->sockfd, &chose, sizeof(chose), 0);
-                switch(chose)
-                {
-                    case 1: // 登录
-
-                        break;
-                    case 2: // 注册
-
-                        break;
-                    case 3: // 退出
-
-                        break;
-                    default :
-                        break;
-                }
-
-            }else  // 普通信息，没有进行切换菜单选项
-            {
-                /*通过结构体中的账号来识别，谁发送，发送给谁*/
-                char buff[1024] = {0};
-                printf("真实信息\n");
-                recv(ptr->sockfd,buff,ptr->len,0);
-            }
-            
-
-        }
+        if (strcmp(p->account, account) == 0)
+            return p;
+        p = p->unext;
     }
     return NULL;
 }
 
-//监控函数，判断心跳是否超时
-void monitor_func(void* arg)
+// 检查群名是否存在
+GROUP* find_group(const char* gname)
 {
-    FILE* fptr = (FILE*)arg;
-
-    //如果是头节点后面为空，先睡觉，等插了第一个节点被唤醒
-    if(head.next == NULL)
+    GROUP* p = g_group_head.gnext;
+    while (p != NULL)
     {
-        pthread_mutex_lock(&mutex);
-        pthread_cond_wait(&cond,&mutex);
-        pthread_mutex_unlock(&mutex);
+        if (strcmp(p->gname, gname) == 0)
+            return p;
+        p = p->gnext;
     }
-
-    SOC* ptr = head.next;
-    SOC* ptr_temp = &head;
-    while(1)
-    {
-        
-        while(ptr != NULL)
-        {
-             //心跳超时了
-            time_t now_time = time(NULL);
-            if(difftime(ptr->ti,now_time) > MAX_TIME)
-            {
-                pthread_mutex_unlock(&mutex);
-
-                now_time = time(NULL);
-                if(difftime(ptr->ti,now_time) > MAX_TIME)
-                {
-                    /*
-                    
-
-
-
-                    标记：当本结构体中的online成员表示账号在线时，要先将账号下线，在释放结构体
-                    
-
-
-
-
-                    */
-                    ptr_temp->next = ptr->next;
-                    fprintf(fptr,"时间：%ld,客户端IP：%s链接超时，服务器与其断开链接!\n", now_time, ptr->ip);
-                    close(ptr->sockfd);
-                    printf("free sockfd %d,id %s,tid %d\n", ptr->sockfd, ptr->ip, ptr->tid);
-                    free(ptr);
-                    ptr = ptr_temp->next;
-                }
-
-                pthread_mutex_unlock(&mutex);
-            }
-
-            ptr_temp = ptr_temp->next;
-            ptr = ptr->next;
-
-        }
-
-        ptr_temp = &head;
-        ptr = head.next;
-
-        sleep(5);
-
-    }
-
-    return;
+    return NULL;
 }
 
-
-
-//获取配置文件中的值，来设置服务器的IP和端口
-IP_CF func_ipconfig()
+// 向全局群注册表中插入群账号
+void add_group_registry(const char* gname)
 {
-    FILE* fptr = fopen("./../server_ipconfigfile.txt","r");
-    if(fptr == NULL)
+    if (find_group(gname) != NULL)
+        return;
+
+    GROUP* node = (GROUP*)calloc(1, sizeof(GROUP));
+    if (node == NULL)
+        return;
+
+    snprintf(node->gname, sizeof(node->gname), "%s", gname);
+
+    node->gnext = g_group_head.gnext;
+    g_group_head.gnext = node;
+}
+
+// 注册用户
+int register_user(const char* account, const char* password, const char* name)
+{
+    if (find_user(account) != NULL)
+        return -1;
+
+    USE* node = (USE*)calloc(1, sizeof(USE));
+    if (node == NULL)
+        return -2;
+
+    snprintf(node->account, sizeof(node->account), "%s", account);
+    snprintf(node->password, sizeof(node->password), "%s", password);
+    snprintf(node->name, sizeof(node->name), "%s", name);
+
+    node->friend.fnum = 0;
+    node->friend.fnext = NULL;
+    node->group.gnum = 0;
+    node->group.gnext = NULL;
+
+    USE* last = &head_user;
+    while (last->unext != NULL)
+    {
+        last = last->unext;
+    }
+    last->unext = node;
+
+    save_user_data();
+    return 0;
+}
+
+// 登录用户
+int login_user(SOC* ptr, const char* account, const char* password)
+{
+    USE* user = find_user(account);
+    if (user == NULL)
+        return 1;
+
+    if (strcmp(user->password, password) != 0)
+        return 2;
+
+    snprintf(ptr->account, sizeof(ptr->account), "%s", account);
+    ptr->online = 1;
+
+    return 0;
+}
+
+// 追加好友
+int add_friend_to_user(const char* account, const char* friend_name)
+{
+    USE* user = find_user(account);
+    if (user == NULL)
+        return -1;
+
+    // 不能重复添加
+    FRIEND* p = user->friend.fnext;
+    while (p != NULL)
+    {
+        if (strcmp(p->fname, friend_name) == 0)
+            return -2;
+        p = p->fnext;
+    }
+
+    FRIEND* node = (FRIEND*)calloc(1, sizeof(FRIEND));
+    if (node == NULL)
+        return -3;
+
+    snprintf(node->fname, sizeof(node->fname), "%s", friend_name);
+    node->fnext = user->friend.fnext;
+    user->friend.fnext = node;
+    user->friend.fnum++;
+
+    save_user_data();
+    return 0;
+}
+
+// 创建群: 只创建群账号名字，放入当前用户的群列表中
+int create_group_for_user(const char* account, const char* gname)
+{
+    USE* user = find_user(account);
+    if (user == NULL)
+        return -1;
+
+    // 不允许重复创建同名群
+    GROUP* p = user->group.gnext;
+    while (p != NULL)
+    {
+        if (strcmp(p->gname, gname) == 0)
+            return -2;
+    }
+
+    GROUP* node = (GROUP*)calloc(1, sizeof(GROUP));
+    if (node == NULL)
+        return -3;
+
+    snprintf(node->gname, sizeof(node->gname), "%s", gname);
+    node->gnext = user->group.gnext;
+    user->group.gnext = node;
+    user->group.gnum++;
+
+    add_group_registry(gname);
+
+    save_user_data();
+    return 0;
+}
+
+// 加入群：用户加入某个群账号
+int join_group_for_user(const char* account, const char* gname)
+{
+    USE* user = find_user(account);
+    if (user == NULL)
+        return -1;
+
+    // 如果这个群名不存在于注册表，不能加入
+    if (find_group(gname) == NULL)
+        return -2;
+
+    // 不允许重复加入
+    GROUP* p = user->group.gnext;
+    while (p != NULL)
+    {
+        if (strcmp(p->gname, gname) == 0)
+            return -3;
+        p = p->gnext;
+    }
+
+    GROUP* node = (GROUP*)calloc(1, sizeof(GROUP));
+    if (node == NULL)
+        return -4;
+
+    snprintf(node->gname, sizeof(node->gname), "%s", gname);
+    node->gnext = user->group.gnext;
+    user->group.gnext = node;
+    user->group.gnum++;
+
+    save_user_data();
+    return 0;
+}
+
+// 生成个人信息字符串：账号、名字、好友列表、群列表
+char* build_profile_string(const char* account)
+{
+    static char buf[2048];
+    memset(buf, 0, sizeof(buf));
+
+    USE* user = find_user(account);
+    if (user == NULL)
+    {
+        snprintf(buf, sizeof(buf), "account not found");
+        return buf;
+    }
+
+    snprintf(buf, sizeof(buf),
+        "account=%s\nname=%s\nfriend_count=%d\ngroup_count=%d\n",
+        user->account, user->name, user->friend.fnum, user->group.gnum);
+
+    strncat(buf, "friends:", sizeof(buf) - strlen(buf) - 1);
+    FRIEND* f = user->friend.fnext;
+    while (f != NULL)
+    {
+        strncat(buf, f->fname, sizeof(buf) - strlen(buf) - 1);
+        strncat(buf, ",", sizeof(buf) - strlen(buf) - 1);
+        f = f->fnext;
+    }
+
+    strncat(buf, "\ngroups:", sizeof(buf) - strlen(buf) - 1);
+    GROUP* g = user->group.gnext;
+    while (g != NULL)
+    {
+        strncat(buf, g->gname, sizeof(buf) - strlen(buf) - 1);
+        strncat(buf, ",", sizeof(buf) - strlen(buf) - 1);
+        g = g->gnext;
+    }
+
+    return buf;
+}
+
+// 给客户端发送文本
+void send_text(SOC* ptr, const char* msg)
+{
+    TYD bag = {0};
+    bag.form = 1;
+    bag.typ = 0;
+    bag.len = (int)strlen(msg) + 1;
+
+    send(ptr->sockfd, &bag, sizeof(bag), 0);
+    send(ptr->sockfd, msg, bag.len, 0);
+}
+
+// 登录后的二级功能：私聊、群聊、查看信息、添加好友、建群、加群
+void* func_client(void* arg)
+{
+    SOC* ptr = (SOC*)arg;
+
+    TYD bag = {0};
+    send_text(ptr, "link successful...");
+
+    while (1)
+    {
+        int res = recv(ptr->sockfd, &bag, sizeof(bag), 0);
+        if (res <= 0)
+        {
+            close(ptr->sockfd);
+            break;
+        }
+
+        // 心跳包
+        if (bag.form == 0)
+        {
+            pthread_mutex_lock(&mutex);
+            ptr->ti = time(NULL);
+            pthread_mutex_unlock(&mutex);
+            continue;
+        }
+
+        if (bag.typ == VISITOR)
+        {
+            int chose = 0;
+            recv(ptr->sockfd, &chose, sizeof(chose), 0);
+
+            switch (chose)
+            {
+                case 1: // 登录
+                {
+                    USER_INFO info = {0};
+                    recv(ptr->sockfd, &info, sizeof(info), 0);
+
+                    int status = login_user(ptr, info.account, info.password);
+                    if (status == 0)
+                    {
+                        send_text(ptr, "login success");
+                    }
+                    else if (status == 1)
+                    {
+                        send_text(ptr, "account not found");
+                    }
+                    else if (status == 2)
+                    {
+                        send_text(ptr, "password wrong");
+                    }
+                    break;
+                }
+
+                case 2: // 注册
+                {
+                    USER_INFO info = {0};
+                    recv(ptr->sockfd, &info, sizeof(info), 0);
+
+                    int status = register_user(info.account, info.password, info.account);
+                    if (status == 0)
+                    {
+                        send_text(ptr, "register success");
+                    }
+                    else if (status == -1)
+                    {
+                        send_text(ptr, "account exists");
+                    }
+                    else
+                    {
+                        send_text(ptr, "register fail");
+                    }
+                    break;
+                }
+
+                case 3: // 退出
+                    send_text(ptr, "bye");
+                    close(ptr->sockfd);
+                    return NULL;
+
+                // 登录后功能：
+                case 10: // 添加好友
+                {
+                    char friend_name[10] = {0};
+                    recv(ptr->sockfd, friend_name, sizeof(friend_name), 0);
+                    int ret = add_friend_to_user(ptr->account, friend_name);
+                    if (ret == 0)
+                        send_text(ptr, "add friend success");
+                    else if (ret == -1)
+                        send_text(ptr, "user not found");
+                    else if (ret == -2)
+                        send_text(ptr, "friend already exists");
+                    else
+                        send_text(ptr, "add friend fail");
+                    break;
+                }
+
+                case 11: // 创建群
+                {
+                    char gname[10] = {0};
+                    recv(ptr->sockfd, gname, sizeof(gname), 0);
+                    int ret = create_group_for_user(ptr->account, gname);
+                    if (ret == 0)
+                        send_text(ptr, "create group success");
+                    else if (ret == -1)
+                        send_text(ptr, "user not found");
+                    else if (ret == -2)
+                        send_text(ptr, "group already exists");
+                    else
+                        send_text(ptr, "create group fail");
+                    break;
+                }
+
+                case 12: // 加入群
+                {
+                    char gname[10] = {0};
+                    recv(ptr->sockfd, gname, sizeof(gname), 0);
+                    int ret = join_group_for_user(ptr->account, gname);
+                    if (ret == 0)
+                        send_text(ptr, "join group success");
+                    else if (ret == -1)
+                        send_text(ptr, "user not found");
+                    else if (ret == -2)
+                        send_text(ptr, "group not found");
+                    else if (ret == -3)
+                        send_text(ptr, "already joined");
+                    else
+                        send_text(ptr, "join group fail");
+                    break;
+                }
+
+                case 13: // 私聊（指定好友）
+                {
+                    char target[10] = {0};
+                    char msg[256] = {0};
+
+                    recv(ptr->sockfd, target, sizeof(target), 0);
+                    recv(ptr->sockfd, msg, sizeof(msg), 0);
+
+                    if (find_user(target) == NULL)
+                    {
+                        send_text(ptr, "target not found");
+                    }
+                    else
+                    {
+                        send_text(ptr, "private chat ready");
+                    }
+                    break;
+                }
+
+                case 14: // 群聊（指定群）
+                {
+                    char gname[10] = {0};
+                    char msg[256] = {0};
+
+                    recv(ptr->sockfd, gname, sizeof(gname), 0);
+                    recv(ptr->sockfd, msg, sizeof(msg), 0);
+
+                    if (find_group(gname) == NULL)
+                    {
+                        send_text(ptr, "group not found");
+                    }
+                    else
+                    {
+                        send_text(ptr, "group chat ready");
+                    }
+                    break;
+                }
+
+                case 15: // 个人信息
+                {
+                    char* info = build_profile_string(ptr->account);
+                    send_text(ptr, info);
+                    break;
+                }
+
+                case 16: // 其他功能预留接口
+                {
+                    send_text(ptr, "other function interface reserved");
+                    break;
+                }
+
+                default:
+                    send_text(ptr, "unknown command");
+                    break;
+            }
+        }
+        else
+        {
+            char buff[1024] = {0};
+            recv(ptr->sockfd, buff, bag.len, 0);
+            printf("真实信息：%s\n", buff);
+        }
+    }
+
+    return NULL;
+}
+
+// 监控心跳是否超时
+void monitor_func(void* arg)
+{
+    (void)arg;
+
+    while (1)
+    {
+        sleep(1);
+        pthread_mutex_lock(&mutex);
+
+        SOC* ptr = head.next;
+        SOC* pre = &head;
+        while (ptr != NULL)
+        {
+            if (time(NULL) - ptr->ti > MAX_TIME)
+            {
+                SOC* q = ptr;
+                pre->next = ptr->next;
+                ptr = ptr->next;
+
+                close(q->sockfd);
+                free(q);
+                continue;
+            }
+
+            pre = ptr;
+            ptr = ptr->next;
+        }
+
+        pthread_mutex_unlock(&mutex);
+    }
+}
+
+// 获取配置文件中的值，来设置服务器的IP和端口
+IP_CF func_ipconfig(void)
+{
+    FILE* fptr = fopen("./../server_ipconfigfile.txt", "r");
+    if (fptr == NULL)
     {
         printf("fopen error!\n");
-        fflush(stdout);
         exit(1);
     }
 
@@ -273,66 +705,41 @@ IP_CF func_ipconfig()
     fscanf(fptr, "port = %d", &(temp.port));
 
     fclose(fptr);
-
     return temp;
 }
 
-
-
-
-
-
-
-
-
-
-
-int main()
+int main(void)
 {
-    //加载数据到全局head_user（已注册用户，头节点不存储数据）
+    // 加载数据到全局head_user（已注册用户）
     func_user();
 
-    pthread_cond_init(&cond,NULL);
-    pthread_mutex_init(&mutex,NULL);
+    pthread_cond_init(&cond, NULL);
+    pthread_mutex_init(&mutex, NULL);
 
-    FILE* fptr = fopen("log.txt","a");
-    if(fptr == NULL)
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    g_log_fp = fopen("log.txt", "a");
+    if (g_log_fp == NULL)
     {
-        printf("log open error!\n");
-        fflush(stdout);
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&cond);
-        exit(1);
+        perror("log open error");
+        return 1;
     }
 
-
-    int ttid = 0;
     int result = 0;
-    //监控心跳是否超时线程
-    if( (result = pthread_create(&ttid,NULL,(void*(*)(void*))monitor_func,(void*)fptr)) != 0 )
+    pthread_t ttid = 0;
+    result = pthread_create(&ttid, NULL, (void*(*)(void*))monitor_func, NULL);
+    if (result != 0)
     {
-        // 线程开启失败，发送链接失败信号
-        fprintf(stderr,"pthread_create error:%s\n",strerror(result));
-        printf("monitor error!\n");
-        time_t tim = time(NULL);
-        fprintf(fptr,"时间：%ld,心跳线程开启失败！\n",tim);
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&cond);
-        fclose(fptr);
-        exit(1);
+        perror("pthread_create monitor fail");
+        return 1;
     }
 
-    TYD bag = {0};
-    int sockfd = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-    if(sockfd < 0)
+    g_server_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_server_sock < 0)
     {
         perror("socket error!");
-        time_t tim = time(NULL);
-        fprintf(fptr,"时间：%ld,套接字创建失败！\n",tim);
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&cond);
-        fclose(fptr);
-        return 1;
+        cleanup_and_exit(1);
     }
 
     IP_CF ip_cf = func_ipconfig();
@@ -343,117 +750,59 @@ int main()
     addr.sin_port = htons(ip_cf.port);
     addr.sin_addr.s_addr = inet_addr(ip_cf.buff);
 
-    if(bind(sockfd,&addr,len) < 0)
+    if (bind(g_server_sock, (struct sockaddr*)&addr, len) < 0)
     {
         perror("bind error!");
-        time_t tim = time(NULL);
-        fprintf(fptr,"时间：%ld,套接字绑定失败！\n",tim);
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&cond);
-        close(sockfd);
-        fclose(fptr);
-        return 1;
+        cleanup_and_exit(1);
     }
 
-    if(listen(sockfd,50) < 0)
+    if (listen(g_server_sock, 50) < 0)
     {
         perror("listen error!");
-        time_t tim = time(NULL);
-        fprintf(fptr,"时间：%ld,监听失败！\n",tim);
-        close(sockfd);
-        fclose(fptr);
-        return 1;
+        cleanup_and_exit(1);
     }
 
-    printf("服务器已启动，本服务器端口为%d,ip地址为：%s,监听中...\n",
-        ntohs(addr.sin_port), inet_ntoa(addr.sin_addr));
-    time_t ttim = time(NULL);
-    fprintf(fptr,"时间：%ld,服务器已启动，本服务器端口为%d,ip地址为：%s,监听中...\n",ttim);
-    fflush(stdout);
+    printf("服务器已启动，监听中...\n");
 
-    //创建结构体链表中的头节点，存储客户端信息
-    SOC head = {0};
-    head.next = NULL;
-    
-    while(1)
+    while (1)
     {
-        //本结构体用来存储客户端的信息,以及其大小信息
         struct sockaddr_in addr_client = {0};
         socklen_t len_client = sizeof(addr_client);
 
-        int sockfd_client = 0;
-        if( (sockfd_client = accept(sockfd,(struct sockaddr*)&addr_client,&len_client)) < 0 )
+        int sockfd_client = accept(g_server_sock, (struct sockaddr*)&addr_client, &len_client);
+        if (sockfd_client < 0)
         {
-            //出错就跳过本次接听
             perror("accept error!");
-            ttim = time(NULL);
-            fprintf(fptr,"时间：%ld,accept error\n",ttim);
-            fflush(stdout);
             continue;
         }
 
-        //在堆上创建空间，防止将套接字传入线程函数的时候，在栈上的套接字已经销毁
-        SOC* ptr = (SOC *)malloc(sizeof(SOC));
-        if(ptr == NULL)
+        SOC* ptr = (SOC*)calloc(1, sizeof(SOC));
+        if (ptr == NULL)
         {
-            printf("malloc error!\n");
-            close(sockfd);
-            pthread_mutex_destroy(&mutex);
-            pthread_cond_destroy(&cond);
-            ttim = time(NULL);
-            fprintf(fptr,"时间：%ld,malloc error!\n",ttim);
-            fflush(stdout);
-            fclose(fptr);
-            return 1;
-        }
-
-        memset(ptr,0,sizeof(SOC));
-
-        // 将客户端的套接字赋值给在这个堆内存中
-        ptr->sockfd = sockfd_client;
-        ptr->ti = time(NULL);
-        strcpy(ptr->ip, inet_ntoa(addr_client.sin_addr));
-        ptr->port = ntohs(addr_client.sin_port);
-        ptr->form = 0;
-        ptr->online = 0;
-        ptr->len = 0;
-        ptr->next = NULL;
-        
-        pthread_t tid = 0;
-        int val = 0;
-        if( (val = pthread_create(&tid,NULL,func_client,(void*)ptr)) != 0 )
-        {
-            // 线程开启失败，发送链接失败信号
-            fprintf(stderr,"pthread_create error:%s\n",strerror(val));
-            bag.form = 1, bag.len = strlen("server busy...");
-            send(sockfd_client,&bag,sizeof(bag),0);
-            send(sockfd_client,"server busy...",sizeof("server busy..."),0);
-            ttim = time(NULL);
-            fprintf(fptr,"时间：%ld；线程创建失败！套接字为%d,链接客户端id为：%s，服务器关闭与其链接！\n",ttim, ptr->sockfd, ptr->ip);
-            memset(&bag,0,sizeof(bag));
-            free(ptr);
+            perror("malloc error!");
             close(sockfd_client);
             continue;
         }
+
+        ptr->sockfd = sockfd_client;
+        ptr->ti = time(NULL);
+        ptr->online = 0;
+        strcpy(ptr->ip, inet_ntoa(addr_client.sin_addr));
+        ptr->port = ntohs(addr_client.sin_port);
+        ptr->next = NULL;
+
+        pthread_t tid = 0;
+        if (pthread_create(&tid, NULL, func_client, (void*)ptr) != 0)
+        {
+            perror("pthread_create error");
+            close(sockfd_client);
+            free(ptr);
+            continue;
+        }
+
         ptr->tid = tid;
-        //将新的结构体放入链表的节点中
         node_process(&head, ptr);
-
-        ttim = time(NULL);
-        fprintf(fptr,"时间：%ld；%d线程创建完毕！套接字为%d,链接客户端id为：%s\n",ttim, tid, ptr->sockfd, ptr->ip);
-
-        //创建完线程后，直接将线程分离，从而不需要主线程回收线程资源，而是线程结束后自动回收资源
-        pthread_detach(tid);
     }
-
-    pthread_mutex_destroy(&mutex);
-    pthread_cond_destroy(&cond);
-
-
-    ttim = time(NULL);
-    fprintf(fptr,"时间：%ld,服务器关闭！\n",ttim);
-    fflush(stdout);
-    fclose(fptr);
 
     return 0;
 }

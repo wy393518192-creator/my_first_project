@@ -21,11 +21,11 @@
 // 真正的 群 的节点
 typedef struct group
 {
-    char gname[10]; // 群名字
+    char gname[10]; // 群名字，也就是群账号
     struct group* gnext;
 } GROUP;
 
-// 账号中 裙 头节点，不存储数据
+// 账号中 群 头节点，不存储数据
 typedef struct
 {
     int gnum; // 群数量
@@ -35,7 +35,7 @@ typedef struct
 // 真正的 朋友 的节点
 typedef struct friend
 {
-    char fname[10]; // 群名字
+    char fname[10]; // 朋友名字，也就是朋友账号
     struct friend* fnext;
 } FRIEND;
 
@@ -43,10 +43,10 @@ typedef struct friend
 typedef struct
 {
     int fnum; // 朋友数量
-    GROUP* fnext; // 指向第一个朋友
+    FRIEND* fnext; // 指向第一个朋友
 } HEAD_FRIEND;
 
-//账号结构体
+// 账号结构体
 typedef struct use
 {
     char account[10]; // 账号
@@ -55,22 +55,25 @@ typedef struct use
     char name[10]; // 别名
 
     HEAD_FRIEND friend; // 朋友链表
-    HEAD_GROUP group; // 群链表
+    HEAD_GROUP group;   // 群链表
 
     struct use* unext; // 下一个用户
-
-
 } USE;
 
-
-
-//结构体，用来分辨是信息还是心跳，以及信息长度
+// 登录/注册请求载荷
 typedef struct
 {
-    int typ;     // 0代表此信息为执行信息，1为普通消息（比如在客户端最外层界面发送一个1过来，如果tyd是0则代表是选的界面上的功能1代表要登录，否则就是普通的发过来的信息1）
-    int form; // 0为心跳，1为真实信息
-    int len;  // 信息长度
-}TYD;
+    char account[10];
+    char password[10];
+} USER_INFO;
+
+// 结构体，用来分辨是信息还是心跳，以及信息长度
+typedef struct
+{
+    int typ;   // 0代表此信息为执行信息，1为普通消息
+    int form;  // 0为心跳，1为真实信息
+    int len;   // 信息长度
+} TYD;
 
 // 客户端节点
 typedef struct clinet_node
@@ -85,23 +88,17 @@ typedef struct clinet_node
     int online; // 在线状态，1在线，0访客
     char account[10]; // 在线时，本成员才有意义
 
-    char account[10]; // 账号，只有当online为在线时，此数据才有意义
-
     int form; // 0为心跳，1为真实信息
     int len;  // 信息长度
 
     struct clinet_node* next;
-}SOC;
+} SOC;
 
-// 从配置文件中读取本服务器的ip和端口（用户拿到程序后，可在文件中修改成他拥有的服务器的ip和端口）
+// 从配置文件中读取本服务器的ip和端口
 typedef struct
 {
-    char buff[16]; //配置文件中的IP地址
-    int port;      //配置文件中的port端口
-
-}IP_CF;
-
-
-
+    char buff[16]; // 配置文件中的IP地址
+    int port;      // 配置文件中的port端口
+} IP_CF;
 
 #endif
