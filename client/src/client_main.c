@@ -1,51 +1,13 @@
-/*
-*客户端
-*/
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <pthread.h>
-#include <sys/types.h>
-#include <string.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/stat.h>
-#include <sys/ipc.h>
-#include <sys/fcntl.h>
-#include <time.h>
+// /*
+// *客户端
+// */
+
+#include "cctype.h"
+
+#define VISITOR 0 // 执行信息
+#define USER 1 //普通信息
 
 
-//结构体，用来分辨是信息还是心跳，以及信息长度
-typedef struct
-{
-    int form; // 0为心跳，1为真实信息
-    int len;  // 信息长度
-}TYD;
-
-//心跳线程
-void* func_hrartbest(void * arg)
-{
-    int sockfd = *(int*)arg;
-
-    TYD best;
-    best.form = 0;
-    best.len = 0;
-
-    while(1)
-    {
-        send(sockfd,&best,sizeof(best),0);
-        sleep(5);
-    }
-    return NULL;
-}
-
-typedef struct
-{
-    char buff[16]; //配置文件中的IP地址
-    int port;      //配置文件中的port端口
-
-}IP_CF;
 
 //获取配置文件中的值，来设置服务器的IP和端口
 IP_CF func_ipconfig()
@@ -66,6 +28,27 @@ IP_CF func_ipconfig()
 
     return temp;
 }
+
+// 信息发送函数
+void func_send(int sockfd, TYD* bag, void * message)
+{
+    
+    send(sockfd,bag,sizeof(TYD), 0);
+    if(bag->typ == VISITOR)
+    {
+        send(sockfd, (int*)message, bag->len, 0);
+    }else
+    {
+        send(sockfd, (char*)message, bag->len, 0);
+    }
+}
+
+
+
+
+
+
+
 
 int main()
 {
@@ -153,14 +136,20 @@ int main()
 
         }while(1);
 
+        int len = sizeof(chose);
         switch(chose)
         {
             case 1:
+
+                func_send(sockfd, &bag, &chose);
+
+
                 break;
             case 2:
                 break;
             case 3:
                 logo = 0;
+                printf("程序退出\n");
                 break;
             default:
                 break;
@@ -168,6 +157,8 @@ int main()
 
     }
 
+
+    close(sockfd);
 
     return 0;
 }

@@ -2,21 +2,11 @@
 *服务器
 */
 
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <unistd.h>
-// #include <sys/socket.h>
-// #include <pthread.h>
-// #include <sys/types.h>
-// #include <string.h>
-// #include <netinet/in.h>
-// #include <arpa/inet.h>
-// #include <sys/stat.h>
-// #include <sys/ipc.h>
-// #include <sys/fcntl.h>
-// #include <time.h>
+#include "stype.h"
+#include "user.h"
 
-#include "type.h"
+#define VISITOR 0 // 执行信息
+#define USER 1 //普通信息
 
 //条件锁，互斥锁，读写锁
 pthread_cond_t cond;
@@ -26,31 +16,90 @@ pthread_mutex_t mutex;
 //最大心跳时间间隔
 #define MAX_TIME  15.0
 
-//结构体，用来分辨是信息还是心跳，以及信息长度
-typedef struct
-{
-    int form; // 0为心跳，1为真实信息
-    int len;  // 信息长度
-}TYD;
 
-typedef struct clinet_node
-{
-    int sockfd; // accept之后，与客户端的套接字
-    pthread_t tid; // 所处线程id
-
-    char ip[16]; // 客户端IP
-    int port; // 客户端的port端口
-
-    time_t ti; // 上次心跳时间
-    int online; // 在线状态，1在线，0掉线
-
-    int form; // 0为心跳，1为真实信息
-    int len;  // 信息长度
-
-    struct clinet_node* next;
-}SOC;
-
+// 定义一个指向客户端信息的头指针（不存储数据 ）
 static SOC head = {0};//初始化，next指针为null
+
+//定义一个客户账号信息的头节点（不存储数据，第二个节点，即首元节点才存储数据）
+USE head_user = {0};
+
+// 在文件中加载账号数据（当服务器开启时，加载已经注册的用户的信息）
+void func_user()
+{
+    FILE* ufptr = open("./../data/userdata.txt", "r");
+    if(ufptr == NULL)
+    {
+        printf("数据加载失败！\n");
+        exit(1);
+    }
+
+    USE* temp1 = &head_user;
+    USE temp2 = {0};
+    while(fread(&temp2, sizeof(USE), 1, ufptr) > 0)
+    {
+        USE* temp3 = (USE*)calloc(1,sizeof(USE));//就不判错了
+        *temp3 = temp2;
+        temp3->unext = NULL;
+        temp3->friend.fnext = NULL;
+        temp3->group.gnext = NULL;
+
+        if(temp3->friend.fnum > 0)
+        {
+
+            temp3->friend.fnext = (FRIEND*)calloc(1, sizeof(FRIEND));
+            FRIEND *fritemp = temp3->friend.fnext;
+            FRIEND* fri;
+            
+            
+            for(int i = 0; i < temp3->friend.fnum; i++)
+            {
+                
+                fread(fritemp,sizeof(FRIEND),1,ufptr);
+                fritemp->fnext = NULL;
+                fri = fritemp;
+                fri->fnext = (FRIEND*)calloc(1, sizeof(FRIEND));
+                fritemp = fri->fnext;
+            }
+            
+            free(fritemp);
+            fri->fnext = NULL;
+
+        }
+
+        if(temp3->group.gnum > 0)
+        {
+
+            temp3->group.gnum = (GROUP*)calloc(1, sizeof(GROUP));
+            GROUP *grotemp = temp3->group.gnext;
+            GROUP* gro;
+            
+            
+            for(int J = 0; J < temp3->group.gnum; J++)
+            {
+                
+                fread(grotemp,sizeof(GROUP),1,ufptr);
+                grotemp->gnext = NULL;
+                gro = grotemp;
+                gro->gnext = (GROUP*)calloc(1, sizeof(GROUP));
+                grotemp = gro->gnext;
+            }
+            
+            free(grotemp);
+            gro->gnext = NULL;
+
+        }
+
+
+        temp1->unext = temp3;
+        memset(&temp2,0,sizeof(USE));
+        temp1 = temp1->unext;
+    }
+
+    //加载完数据，关闭文件
+    fclose(ufptr);
+
+}
+
 
 //将线程的信息放入一个结构体链表中的函数
 void node_process(SOC* head, SOC* new_node)
@@ -105,9 +154,34 @@ void* func_client(void* arg)
         
         }else
         {
-            char buff[1024] = {0};
-            printf("真实信息\n");
-            recv(ptr->sockfd,buff,ptr->len,0);
+            // 说明是执行指令，客户端在切菜单
+            if(bag.typ == VISITOR)
+            {
+                int chose = 0;
+                recv(ptr->sockfd, &chose, sizeof(chose), 0);
+                switch(chose)
+                {
+                    case 1: // 登录
+
+                        break;
+                    case 2: // 注册
+
+                        break;
+                    case 3: // 退出
+
+                        break;
+                    default :
+                        break;
+                }
+
+            }else  // 普通信息，没有进行切换菜单选项
+            {
+                /*通过结构体中的账号来识别，谁发送，发送给谁*/
+                char buff[1024] = {0};
+                printf("真实信息\n");
+                recv(ptr->sockfd,buff,ptr->len,0);
+            }
+            
 
         }
     }
@@ -143,6 +217,18 @@ void monitor_func(void* arg)
                 now_time = time(NULL);
                 if(difftime(ptr->ti,now_time) > MAX_TIME)
                 {
+                    /*
+                    
+
+
+
+                    标记：当本结构体中的online成员表示账号在线时，要先将账号下线，在释放结构体
+                    
+
+
+
+
+                    */
                     ptr_temp->next = ptr->next;
                     fprintf(fptr,"时间：%ld,客户端IP：%s链接超时，服务器与其断开链接!\n", now_time, ptr->ip);
                     close(ptr->sockfd);
@@ -169,12 +255,7 @@ void monitor_func(void* arg)
     return;
 }
 
-typedef struct
-{
-    char buff[16]; //配置文件中的IP地址
-    int port;      //配置文件中的port端口
 
-}IP_CF;
 
 //获取配置文件中的值，来设置服务器的IP和端口
 IP_CF func_ipconfig()
@@ -196,8 +277,21 @@ IP_CF func_ipconfig()
     return temp;
 }
 
+
+
+
+
+
+
+
+
+
+
 int main()
 {
+    //加载数据到全局head_user（已注册用户，头节点不存储数据）
+    func_user();
+
     pthread_cond_init(&cond,NULL);
     pthread_mutex_init(&mutex,NULL);
 
@@ -321,7 +415,7 @@ int main()
         strcpy(ptr->ip, inet_ntoa(addr_client.sin_addr));
         ptr->port = ntohs(addr_client.sin_port);
         ptr->form = 0;
-        ptr->online = 1;
+        ptr->online = 0;
         ptr->len = 0;
         ptr->next = NULL;
         
