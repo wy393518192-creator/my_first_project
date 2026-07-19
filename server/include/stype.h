@@ -18,6 +18,13 @@
 #include <sys/fcntl.h>
 #include <time.h>
 
+#define VISITOR 0 // 最外层功能命令
+#define USER    1 // 普通文本消息
+
+// 最大心跳时间间隔
+#define MAX_TIME 15.0
+
+
 // 真正的 群 的节点
 typedef struct group
 {
