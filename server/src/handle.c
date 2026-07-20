@@ -700,9 +700,28 @@ IP_CF func_ipconfig(void)
     }
 
     IP_CF temp = {0};
-    fscanf(fptr, "ip = %s", temp.buff);
-    fscanf(fptr, "port = %d", &(temp.port));
+    char line[64] = {0};
+
+    while (fgets(line, sizeof(line), fptr) != NULL)
+    {
+        if (sscanf(line, "ip = %15s", temp.buff) == 1)
+        {
+            continue;
+        }
+
+        if (sscanf(line, "port = %d", &(temp.port)) == 1)
+        {
+            break;
+        }
+    }
 
     fclose(fptr);
+
+    if (temp.buff[0] == '\0' || temp.port == 0)
+    {
+        printf("config parse error!\n");
+        exit(1);
+    }
+
     return temp;
 }
