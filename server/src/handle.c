@@ -384,23 +384,70 @@ char* build_profile_string(const char* account)
     return buf;
 }
 
-// 给客户端发送文本
-void send_text(SOC* ptr, const char* msg)
+// 循环发送完整缓冲区，避免一次 send 只发出部分数据
+// 逻辑：只要 len 还没发完，就一直把剩余字节继续发出去
+static int send_all(int fd, const void* data, size_t len)
 {
-    TYD bag = {0};
-    bag.form = 1;
-    bag.typ = 0;
-    bag.len = (int)strlen(msg) + 1;
-
-    send(ptr->sockfd, &bag, sizeof(bag), 0);
-    send(ptr->sockfd, msg, bag.len, 0);
+    const char* p = (const char*)data;
+    while (len > 0)
+    {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0)
+        {
+            // 发送失败或连接断开时返回 -1，外层做错误处理
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
 }
 
-// 服务器命令执行接口
+// 按协议帧格式发送一包数据：先发头部 TYD，再发 body
+// 其中 typ 表示命令还是普通消息，form 表示是否为真实数据包，len 表示 body 长度
+static int send_frame(SOC* ptr, int typ, int form, const void* data, int len)
+{
+    TYD bag = {0};
+    bag.form = form;
+    bag.typ = typ;
+    bag.len = len;
+
+    // 先把协议头部完整发出去
+    if (send_all(ptr->sockfd, &bag, sizeof(bag)) < 0)
+    {
+        return -1;
+    }
+
+    // 如果有 body，就把 body 一并完整发出去
+    if (len > 0 && data != NULL && send_all(ptr->sockfd, data, (size_t)len) < 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+// 给客户端发送文本：把普通文本按命令协议帧的方式发送出去
+// 这里用 VISITOR 类型表示这是一条命令/响应信息，而不是普通聊天文本
+void send_text(SOC* ptr, const char* msg)
+{
+    if (msg == NULL)
+    {
+        // 防止空指针传入导致 strlen 崩溃，直接返回
+        return;
+    }
+
+    int len = (int)strlen(msg) + 1;
+    send_frame(ptr, VISITOR, 1, msg, len);
+}
+
+// 执行服务器命令并把命令输出按块返回给客户端，最后发送一个空包表示结束
+// 逻辑：不用一次性把全部输出读进大缓冲，而是分批 fread，再逐块发送，避免 4KB 限制
 int execute_server_command(SOC* ptr, const char* cmd)
 {
     if (cmd == NULL || cmd[0] == '\0')
     {
+        // 命令为空时直接返回提示信息
         send_text(ptr, "command empty");
         return -1;
     }
@@ -408,36 +455,39 @@ int execute_server_command(SOC* ptr, const char* cmd)
     FILE* fp = popen(cmd, "r");
     if (fp == NULL)
     {
+        // popen 失败就说明命令没有正常打开
         send_text(ptr, "popen fail");
         return -1;
     }
 
-    char result[4096] = {0};
-    size_t len = 0;
+    char result[1024] = {0};
+    size_t nread = 0;
+    int has_output = 0;
 
-    while (fgets(result + len, sizeof(result) - len, fp) != NULL)
+    // 每次 fread 一小块，把这小块直接发给客户端
+    while ((nread = fread(result, 1, sizeof(result), fp)) > 0)
     {
-        len = strlen(result);
-        if (len >= sizeof(result) - 1)
+        has_output = 1;
+        if (send_frame(ptr, VISITOR, 1, result, (int)nread) < 0)
         {
-            break;
+            pclose(fp);
+            return -1;
         }
     }
 
-    int status = pclose(fp);
-    if (status == -1)
+    if (pclose(fp) < 0)
     {
-        send_text(ptr, "pclose fail");
         return -1;
     }
 
-    if (result[0] == '\0')
+    if (has_output == 0)
     {
         send_text(ptr, "command no output");
         return 0;
     }
 
-    send_text(ptr, result);
+    // 发送一个长度为 0 的结束帧，告诉客户端这一轮命令输出已经结束了
+    send_frame(ptr, VISITOR, 1, NULL, 0);
     return 0;
 }
 
@@ -577,8 +627,15 @@ void* func_client(void* arg)
 
         if (bag.form == 0)
         {
+            time_t now = time(NULL);
+            char time_buf[64] = {0};
+            struct tm* tm_info = localtime(&now);
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+            printf("[%s] heartbeat from %s:%d\n", time_buf, ptr->ip, ptr->port);
+
             pthread_mutex_lock(&mutex);
-            ptr->ti = time(NULL);
+            ptr->ti = now;
             pthread_mutex_unlock(&mutex);
             continue;
         }
