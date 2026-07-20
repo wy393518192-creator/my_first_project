@@ -74,6 +74,13 @@ typedef struct
     char password[10];
 } USER_INFO;
 
+// 私聊/群聊 单帧载荷：目标 + 消息 一次发完，避免两次 send 粘包错位
+typedef struct
+{
+    char target[10]; // 私聊=对方账号, 群聊=群账号
+    char msg[256];   // 消息正文
+} CHAT_PAYLOAD;
+
 // 结构体，用来分辨是信息还是心跳，以及信息长度
 typedef struct
 {

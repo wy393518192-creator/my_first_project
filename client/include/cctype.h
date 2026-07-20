@@ -74,6 +74,13 @@ typedef struct
     int len;
 } TYD;
 
+// 私聊/群聊 单帧载荷：目标 + 消息 一次发完，避免两次 send 粘包错位
+typedef struct
+{
+    char target[10]; // 私聊=对方账号, 群聊=群账号
+    char msg[256];   // 消息正文
+} CHAT_PAYLOAD;
+
 // 心跳线程
 void* func_hrartbest(void* arg);
 

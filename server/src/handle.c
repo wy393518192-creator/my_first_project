@@ -7,6 +7,26 @@ extern pthread_cond_t cond;
 extern pthread_mutex_t mutex;
 extern GROUP g_group_head;
 
+// 精确读取 len 字节，防止 TCP 拆包导致读不全
+static int recv_exact(int fd, void* data, size_t len)
+{
+    char* p = (char*)data;
+    while (len > 0)
+    {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0)
+        {
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+// 发送锁：多个线程同时向客户端推送消息时，防止帧交错
+static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 
 
@@ -412,19 +432,22 @@ static int send_frame(SOC* ptr, int typ, int form, const void* data, int len)
     bag.typ = typ;
     bag.len = len;
 
+    int ret = 0;
+    pthread_mutex_lock(&g_send_mutex);
+
     // 先把协议头部完整发出去
     if (send_all(ptr->sockfd, &bag, sizeof(bag)) < 0)
     {
-        return -1;
+        ret = -1;
     }
-
     // 如果有 body，就把 body 一并完整发出去
-    if (len > 0 && data != NULL && send_all(ptr->sockfd, data, (size_t)len) < 0)
+    else if (len > 0 && data != NULL && send_all(ptr->sockfd, data, (size_t)len) < 0)
     {
-        return -1;
+        ret = -1;
     }
 
-    return 0;
+    pthread_mutex_unlock(&g_send_mutex);
+    return ret;
 }
 
 // 给客户端发送文本：把普通文本按命令协议帧的方式发送出去
@@ -441,13 +464,25 @@ void send_text(SOC* ptr, const char* msg)
     send_frame(ptr, VISITOR, 1, msg, len);
 }
 
-// 执行服务器命令并把命令输出按块返回给客户端，最后发送一个空包表示结束
-// 逻辑：不用一次性把全部输出读进大缓冲，而是分批 fread，再逐块发送，避免 4KB 限制
+// 给客户端发送普通聊天消息：此类消息只发给目标用户，不广播给其它客户端
+void send_user_message(SOC* ptr, const char* msg)
+{
+    if (msg == NULL)
+    {
+        return;
+    }
+
+    int len = (int)strlen(msg) + 1;
+    send_frame(ptr, USER, 1, msg, len);
+}
+
+// 执行服务器命令并把输出缓冲后一次性返回给客户端
+// 逻辑：先完整读完本次命令的输出，拼成一个字符串，再作为单帧回执发送
+// 这样每次命令的结果独立完整，不会和上一次的残留混在一起
 int execute_server_command(SOC* ptr, const char* cmd)
 {
     if (cmd == NULL || cmd[0] == '\0')
     {
-        // 命令为空时直接返回提示信息
         send_text(ptr, "command empty");
         return -1;
     }
@@ -455,40 +490,87 @@ int execute_server_command(SOC* ptr, const char* cmd)
     FILE* fp = popen(cmd, "r");
     if (fp == NULL)
     {
-        // popen 失败就说明命令没有正常打开
         send_text(ptr, "popen fail");
         return -1;
     }
 
-    char result[1024] = {0};
+    char out_buff[3600] = {0};
+    size_t out_len = 0;
+    char chunk[512] = {0};
     size_t nread = 0;
-    int has_output = 0;
 
-    // 每次 fread 一小块，把这小块直接发给客户端
-    while ((nread = fread(result, 1, sizeof(result), fp)) > 0)
+    // 分块读取本次命令的全部输出，拼接到 out_buff
+    while ((nread = fread(chunk, 1, sizeof(chunk), fp)) > 0)
     {
-        has_output = 1;
-        if (send_frame(ptr, VISITOR, 1, result, (int)nread) < 0)
+        if (out_len + nread >= sizeof(out_buff))
         {
-            pclose(fp);
-            return -1;
+            // 超出缓冲就截断，防止溢出
+            size_t remain = sizeof(out_buff) - out_len - 1;
+            memcpy(out_buff + out_len, chunk, remain);
+            out_len += remain;
+            break;
         }
+        memcpy(out_buff + out_len, chunk, nread);
+        out_len += nread;
     }
+    out_buff[out_len] = '\0';
 
-    if (pclose(fp) < 0)
-    {
-        return -1;
-    }
+    pclose(fp);
 
-    if (has_output == 0)
+    if (out_len == 0)
     {
         send_text(ptr, "command no output");
         return 0;
     }
 
-    // 发送一个长度为 0 的结束帧，告诉客户端这一轮命令输出已经结束了
-    send_frame(ptr, VISITOR, 1, NULL, 0);
+    // 作为单帧命令回执发送（客户端 wait_response 只取一帧）
+    send_text(ptr, out_buff);
     return 0;
+}
+
+// 把普通聊天消息发给某个在线账号
+static int send_text_to_account(const char* account, const char* msg)
+{
+    SOC* p = head.next;
+    while (p != NULL)
+    {
+        if (strcmp(p->account, account) == 0)
+        {
+            send_user_message(p, msg);
+            return 0;
+        }
+        p = p->next;
+    }
+    return -1;
+}
+
+// 把群聊消息广播给当前群内的在线成员
+static int broadcast_group_message(const char* gname, const char* msg)
+{
+    SOC* p = head.next;
+    int count = 0;
+
+    while (p != NULL)
+    {
+        USE* user = find_user(p->account);
+        if (user != NULL)
+        {
+            GROUP* g = user->group.gnext;
+            while (g != NULL)
+            {
+                if (strcmp(g->gname, gname) == 0)
+                {
+                    send_user_message(p, msg);
+                    count++;
+                    break;
+                }
+                g = g->gnext;
+            }
+        }
+        p = p->next;
+    }
+
+    return count;
 }
 
 // 处理登录后命令：添加好友 / 创建群 / 加入群 / 私聊 / 群聊 / 个人信息 / 命令查询
@@ -499,7 +581,8 @@ static int handle_login_subcmd(SOC* ptr, int chose)
         case 10: // 添加好友
         {
             char friend_name[10] = {0};
-            recv(ptr->sockfd, friend_name, sizeof(friend_name), 0);
+            if (recv_exact(ptr->sockfd, friend_name, sizeof(friend_name)) < 0)
+                return -1;
 
             int ret = add_friend_to_user(ptr->account, friend_name);
             if (ret == 0)
@@ -516,7 +599,8 @@ static int handle_login_subcmd(SOC* ptr, int chose)
         case 11: // 创建群
         {
             char gname[10] = {0};
-            recv(ptr->sockfd, gname, sizeof(gname), 0);
+            if (recv_exact(ptr->sockfd, gname, sizeof(gname)) < 0)
+                return -1;
 
             int ret = create_group_for_user(ptr->account, gname);
             if (ret == 0)
@@ -533,7 +617,8 @@ static int handle_login_subcmd(SOC* ptr, int chose)
         case 12: // 加入群
         {
             char gname[10] = {0};
-            recv(ptr->sockfd, gname, sizeof(gname), 0);
+            if (recv_exact(ptr->sockfd, gname, sizeof(gname)) < 0)
+                return -1;
 
             int ret = join_group_for_user(ptr->account, gname);
             if (ret == 0)
@@ -551,39 +636,49 @@ static int handle_login_subcmd(SOC* ptr, int chose)
 
         case 13: // 私聊
         {
-            char target[10] = {0};
-            char msg[256] = {0};
+            CHAT_PAYLOAD payload = {0};
+            char forward_msg[512] = {0};
 
-            recv(ptr->sockfd, target, sizeof(target), 0);
-            recv(ptr->sockfd, msg, sizeof(msg), 0);
+            if (recv_exact(ptr->sockfd, &payload, sizeof(payload)) < 0)
+            {
+                return -1;
+            }
 
-            if (find_user(target) == NULL)
+            // 保证字符串安全结尾
+            payload.target[sizeof(payload.target) - 1] = '\0';
+            payload.msg[sizeof(payload.msg) - 1] = '\0';
+
+            if (find_user(payload.target) == NULL)
             {
-                send_text(ptr, "target not found");
+                return 0; // 目标不存在，静默丢弃
             }
-            else
-            {
-                send_text(ptr, "private chat ready");
-            }
+
+            snprintf(forward_msg, sizeof(forward_msg), "[私聊] %s: %s", ptr->account, payload.msg);
+            send_text_to_account(payload.target, forward_msg);
             return 0;
         }
 
         case 14: // 群聊
         {
-            char gname[10] = {0};
-            char msg[256] = {0};
+            CHAT_PAYLOAD payload = {0};
+            char forward_msg[512] = {0};
 
-            recv(ptr->sockfd, gname, sizeof(gname), 0);
-            recv(ptr->sockfd, msg, sizeof(msg), 0);
+            if (recv_exact(ptr->sockfd, &payload, sizeof(payload)) < 0)
+            {
+                return -1;
+            }
 
-            if (find_group(gname) == NULL)
+            payload.target[sizeof(payload.target) - 1] = '\0';
+            payload.msg[sizeof(payload.msg) - 1] = '\0';
+
+            if (find_group(payload.target) == NULL)
             {
-                send_text(ptr, "group not found");
+                return 0; // 群不存在，静默丢弃
             }
-            else
-            {
-                send_text(ptr, "group chat ready");
-            }
+
+            snprintf(forward_msg, sizeof(forward_msg), "[群聊-%s] %s: %s",
+                     payload.target, ptr->account, payload.msg);
+            broadcast_group_message(payload.target, forward_msg);
             return 0;
         }
 
@@ -597,7 +692,8 @@ static int handle_login_subcmd(SOC* ptr, int chose)
         case 16: // 服务器命令查询
         {
             char cmd[256] = {0};
-            recv(ptr->sockfd, cmd, sizeof(cmd), 0);
+            if (recv_exact(ptr->sockfd, cmd, sizeof(cmd)) < 0)
+                return -1;
             execute_server_command(ptr, cmd);
             return 0;
         }
@@ -618,8 +714,7 @@ void* func_client(void* arg)
 
     while (1)
     {
-        int res = recv(ptr->sockfd, &bag, sizeof(bag), 0);
-        if (res <= 0)
+        if (recv_exact(ptr->sockfd, &bag, sizeof(bag)) < 0)
         {
             close(ptr->sockfd);
             break;
@@ -643,12 +738,20 @@ void* func_client(void* arg)
         if (bag.typ == VISITOR)
         {
             int chose = 0;
-            recv(ptr->sockfd, &chose, sizeof(chose), 0);
+            if (recv_exact(ptr->sockfd, &chose, sizeof(chose)) < 0)
+            {
+                close(ptr->sockfd);
+                break;
+            }
 
             if (chose == 1)
             {
                 USER_INFO info = {0};
-                recv(ptr->sockfd, &info, sizeof(info), 0);
+                if (recv_exact(ptr->sockfd, &info, sizeof(info)) < 0)
+                {
+                    close(ptr->sockfd);
+                    break;
+                }
 
                 int status = login_user(ptr, info.account, info.password);
                 if (status == 0)
@@ -669,7 +772,11 @@ void* func_client(void* arg)
             if (chose == 2)
             {
                 USER_INFO info = {0};
-                recv(ptr->sockfd, &info, sizeof(info), 0);
+                if (recv_exact(ptr->sockfd, &info, sizeof(info)) < 0)
+                {
+                    close(ptr->sockfd);
+                    break;
+                }
 
                 int status = register_user(info.account, info.password, info.account);
                 if (status == 0)
@@ -705,7 +812,14 @@ void* func_client(void* arg)
         else
         {
             char buff[1024] = {0};
-            recv(ptr->sockfd, buff, bag.len, 0);
+            int body_len = bag.len;
+            if (body_len < 0) body_len = 0;
+            if (body_len >= (int)sizeof(buff)) body_len = sizeof(buff) - 1;
+            if (body_len > 0 && recv_exact(ptr->sockfd, buff, (size_t)body_len) < 0)
+            {
+                close(ptr->sockfd);
+                break;
+            }
             printf("真实信息：%s\n", buff);
         }
     }
