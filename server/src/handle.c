@@ -133,6 +133,17 @@ void func_user(void)
     USE temp = {0};
     while (fread(&temp, sizeof(USE), 1, fp) == 1)
     {
+        // 暂存链表元数据，防止 *node = temp 后被覆盖
+        int fnum = temp.friend.fnum;
+        int gnum = temp.group.gnum;
+
+        //  sanity 检查：fnum/gnum 必须在合理范围内，否则文件已损坏
+        if (fnum < 0 || fnum > 1000 || gnum < 0 || gnum > 1000)
+        {
+            fprintf(stderr, "func_user: 数据文件损坏 (fnum=%d, gnum=%d)，停止加载\n", fnum, gnum);
+            break;
+        }
+
         USE* node = (USE*)calloc(1, sizeof(USE));
         if (node == NULL)
         {
@@ -142,7 +153,16 @@ void func_user(void)
 
         *node = temp;
 
-        for (int i = 0; i < temp.friend.fnum; i++)
+        // 关键修复：清除从文件读出的旧指针，重建空链表
+        // temp 里保存的 friend.fnext / group.gnext / unext 是上次运行时
+        // 的堆地址，现在已失效，直接置空防止野指针
+        node->friend.fnum = fnum;
+        node->friend.fnext = NULL;
+        node->group.gnum = gnum;
+        node->group.gnext = NULL;
+        node->unext = NULL;
+
+        for (int i = 0; i < fnum; i++)
         {
             FRIEND* f = (FRIEND*)calloc(1, sizeof(FRIEND));
             if (f == NULL)
@@ -150,12 +170,16 @@ void func_user(void)
                 perror("calloc friend error");
                 continue;
             }
-            fread(f, sizeof(FRIEND), 1, fp);
+            if (fread(f, sizeof(FRIEND), 1, fp) != 1)
+            {
+                free(f);
+                break;
+            }
             f->fnext = node->friend.fnext;
             node->friend.fnext = f;
         }
 
-        for (int i = 0; i < temp.group.gnum; i++)
+        for (int i = 0; i < gnum; i++)
         {
             GROUP* g = (GROUP*)calloc(1, sizeof(GROUP));
             if (g == NULL)
@@ -163,7 +187,11 @@ void func_user(void)
                 perror("calloc group error");
                 continue;
             }
-            fread(g, sizeof(GROUP), 1, fp);
+            if (fread(g, sizeof(GROUP), 1, fp) != 1)
+            {
+                free(g);
+                break;
+            }
             g->gnext = node->group.gnext;
             node->group.gnext = g;
         }
@@ -720,7 +748,7 @@ void* func_client(void* arg)
             break;
         }
 
-        if (bag.form == 0)
+        if (bag.form == 0) // 更新心跳时间
         {
             time_t now = time(NULL);
             char time_buf[64] = {0};
@@ -735,7 +763,7 @@ void* func_client(void* arg)
             continue;
         }
 
-        if (bag.typ == VISITOR)
+        if (bag.typ == VISITOR) //接收到指令
         {
             int chose = 0;
             if (recv_exact(ptr->sockfd, &chose, sizeof(chose)) < 0)
@@ -809,7 +837,7 @@ void* func_client(void* arg)
 
             send_text(ptr, "please login first");
         }
-        else
+        else // 接收到的是普通信息
         {
             char buff[1024] = {0};
             int body_len = bag.len;
